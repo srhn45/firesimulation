@@ -237,18 +237,63 @@ class FireGraph(Dataset):
         '''
         Reads data on drive to be used in training.
         pct = percentage of data to be read from disk
+        This function is defensive: it handles files saved with 2D (single-timestep) or 3D (T, N, F) shapes.
+        Files with unexpected dimensions are skipped and reported.
         '''
         arrays = []
+        bad_files = []
         for file in os.listdir(self.save_dir):
-            if file.endswith(".npy"):
-                arr = np.load(os.path.join(self.save_dir, file), mmap_mode='r')
+            if not file.endswith(".npy"):
+                continue
+            path = os.path.join(self.save_dir, file)
+            try:
+                arr = np.load(path, mmap_mode='r')
+            except Exception as e:
+                print(f"Warning: failed to load {path}: {e}")
+                bad_files.append((file, 'load_error', str(e)))
+                continue
+
+            if arr.ndim == 3:
+                T = arr.shape[0]
+            elif arr.ndim == 2:
+                # Likely a single-simulation with a single timestep saved as (N, F+1)
+                arr = arr[np.newaxis, ...]
+                T = 1
+                print(f"Info: treating 2D file as single-timestep simulation: {file}")
+            else:
+                print(f"Warning: skipping {file} with unexpected ndim={arr.ndim}")
+                bad_files.append((file, 'bad_ndim', arr.ndim))
+                continue
+
+            if T == 0:
+                print(f"Warning: skipping {file} with zero timesteps")
+                bad_files.append((file, 'zero_timesteps', None))
+                continue
+
+            try:
                 n = arr.shape[0]
-                m = math.ceil(pct * n)
+                m = max(1, math.ceil(pct * n))
                 idx = np.random.choice(n, size=m, replace=False)
                 arrays.append(arr[idx])
+            except Exception as e:
+                print(f"Warning: error while sampling {file}: {e}")
+                bad_files.append((file, 'sample_error', str(e)))
+                continue
 
         if arrays:
-            self.data = np.concatenate(arrays, axis=0)
+            try:
+                self.data = np.concatenate(arrays, axis=0)
+            except Exception as e:
+                print(f"Error concatenating arrays: {e}")
+                # fallback: try to stack as list of objects to preserve data for inspection
+                self.data = np.array(arrays, dtype=object)
+        else:
+            self.data = []
+
+        if bad_files:
+            print("generate_dataset finished with warnings. Problematic files:")
+            for fname, reason, info in bad_files:
+                print(f" - {fname}: {reason} {'' if info is None else info}")
 
     def __len__(self):
         return len(self.data)
@@ -413,22 +458,30 @@ class DatasetGenerator():
 def block_diag_batch(adj, batch_size):
     """
     Build block-diagonal adjacency matrix for efficient processing of batches.
+    Accepts a sparse COO tensor (may be uncoalesced) and returns a block-diagonal
+    sparse COO tensor on the same device.
     """
+    # ensure the sparse tensor is coalesced before accessing indices/values
+    adj = adj.coalesce()
+
     N = adj.size(0)
-    indices = adj.indices()
-    values = adj.values()
+    indices = adj.indices()   # (2, E)
+    values = adj.values()     # (E,)
 
-    offsets = torch.arange(batch_size, device=indices.device) * N
-    offsets = offsets.view(1, -1, 1)
+    device = indices.device
 
-    expanded = indices.unsqueeze(1).expand(-1, batch_size, -1)
-    expanded = expanded + offsets
-    expanded = expanded.permute(1, 0, 2).reshape(2, -1)
+    offsets = torch.arange(batch_size, device=device) * N
+    offsets = offsets.view(1, -1, 1)  # (1, B, 1)
+
+    expanded = indices.unsqueeze(1).expand(-1, batch_size, -1)  # (2, B, E)
+    expanded = expanded + offsets  # broadcast add -> shifted indices per block
+    expanded = expanded.permute(1, 0, 2).reshape(2, -1)  # (2, B*E)
 
     expanded_values = values.repeat(batch_size)
 
     size = (N * batch_size, N * batch_size)
-    return torch.sparse_coo_tensor(expanded, expanded_values, size=size, device=adj.device)
+    return torch.sparse_coo_tensor(expanded, expanded_values, size=size, device=device)
+
 
 # %%
 class Trainer():
@@ -466,7 +519,7 @@ class Trainer():
                 os.remove(os.path.join(dir, f))
 
     def train_without_replacement(self, device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-              num_sims=100, num_epochs=100):
+              num_sims=20, num_epochs=100):
         '''
         Generates new simulations for each epoch and clears old simulations to reduce overfitting risk.
         '''
@@ -477,7 +530,7 @@ class Trainer():
         for epoch in range(num_epochs):
             self.generate(num_sims=num_sims)
 
-            self.generator.dataset.generate_dataset()
+            self.generator.dataset.generate_dataset(pct=1)
             print(f"Generated the simulations for {epoch+1}/{num_epochs}.")
             train_loader = DataLoader(self.generator.dataset, batch_size=32, shuffle=True,
                                       num_workers=4, pin_memory=True, persistent_workers=True)
@@ -528,7 +581,7 @@ class Trainer():
 
         self.model.to(device)
         self.model.train()
-        
+
         print('Starting training.')
     
         for epoch in range(num_epochs):
@@ -685,13 +738,48 @@ model_dir = "model/model.pth"
 trainer = Trainer(model_dir = model_dir)
 
 # %%
-#for i in range(100):
-#    trainer.generate(num_sims=10)
+#trainer.clear_data()
 
 # %%
-trainer.train_with_replacement()
+#for i in range(10):
+#    trainer.generate(num_sims=100)
+
+# %%
+trainer.train_without_replacement()
 
 # %%
 trainer.generate_comparison_gif(new_sim=True)
+
+# %%
+# Delete .npy files whose arrays have ndim == 1 (problematic files)
+import os, numpy as np
+
+dataset_dir = trainer.generator.dataset.save_dir if 'trainer' in globals() else os.path.join('simulation_data', f"{128}x{128}")
+
+to_delete = []
+for f in os.listdir(dataset_dir):
+    if not f.endswith('.npy'):
+        continue
+    p = os.path.join(dataset_dir, f)
+    try:
+        arr = np.load(p, mmap_mode='r')
+    except Exception as e:
+        print(f"Could not load {f}: {e}; skipping")
+        continue
+    if getattr(arr, 'ndim', None) == 1:
+        to_delete.append(p)
+
+print(f"Found {len(to_delete)} files to delete:")
+for p in to_delete:
+    print(' -', p)
+
+for p in to_delete:
+    try:
+        os.remove(p)
+    except Exception as e:
+        print(f"Failed to delete {p}: {e}")
+
+print('Deletion complete.')
+
 
 
