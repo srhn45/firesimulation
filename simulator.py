@@ -15,6 +15,10 @@ import time
 from scipy.sparse import lil_matrix
 import os
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+#from functions import gaussian_mixture_field, make_heatmap_gif, adjacency_matrix, block_diag_batch
+#from classes import Simulator, FireGraph, BelieverModel, DatasetGenerator, Trainer
 
 # %%
 def gaussian_mixture_field(size, n_components=None):
@@ -39,9 +43,86 @@ def gaussian_mixture_field(size, n_components=None):
     field = (1 - (field - field.min()) / (field.max() - field.min()))*2
     return field
 
+def make_heatmap_gif(simulator, filename="simulation.gif", cmap="plasma"):
+    '''
+    Create gif of simulation results.
+    '''
+    
+    times = sorted(simulator.maps.keys())
+    frames = [simulator.maps[t] for t in times]
+
+    fig, ax = plt.subplots()
+
+    # --- fire as background ---
+    vmin, vmax = np.min(frames), np.max(frames)
+    fire_img = ax.imshow(frames[0], cmap=cmap, vmin=vmin, vmax=vmax)
+
+    # --- terrain overlay ---
+    terrain_img = ax.imshow(simulator.terrain, cmap="Greens", alpha=0.2)  # low alpha on top
+
+    cbar = fig.colorbar(fire_img, ax=ax)
+    cbar.set_label("Fire Intensity", rotation=270, labelpad=15)
+
+    def update(frame):
+        fire_img.set_data(frame)    
+        return [fire_img, terrain_img]
+
+    ani = animation.FuncAnimation(
+        fig, update, frames=frames, interval=60, blit=True
+    )
+
+    ani.save(filename, writer="pillow")
+    plt.close(fig)
+
+def adjacency_matrix(length, width):
+    '''
+    Sparse adjacency matrix generator for an n x n undirected graph, where each node is connected to its immediate neighbors and itself.
+    '''
+    N = length * width
+    adj = lil_matrix((N, N), dtype=np.float32)
+    directions = [(-1,0), (-1,1), (0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (0,0)] # 8 sided
+    for i in range(N):
+        x, y = divmod(i, width)
+        for dx, dy in directions:
+            nx, ny = x+dx, y+dy
+            if 0 <= nx < length and 0 <= ny < width:
+                j = nx*width + ny
+                adj[i,j] = 1
+    return adj.tocoo()
+
+def block_diag_batch(adj, batch_size):
+    """
+    Build block-diagonal adjacency matrix for efficient processing of batches.
+
+    This function now calls `.coalesce()` on the incoming sparse tensor so it's safe to access
+    `.indices()` and `.values()` without raising "Cannot get indices on an uncoalesced tensor".
+    """
+    # Ensure the sparse tensor is coalesced before reading indices/values
+    adj = adj.coalesce()
+
+    N = adj.size(0)
+    indices = adj.indices()  # shape (2, E)
+    values = adj.values()
+
+    device = indices.device
+
+    offsets = torch.arange(batch_size, device=device) * N
+    offsets = offsets.view(1, -1, 1)
+
+    expanded = indices.unsqueeze(1).expand(-1, batch_size, -1)
+    expanded = expanded + offsets
+    expanded = expanded.permute(1, 0, 2).reshape(2, -1)
+
+    expanded_values = values.repeat(batch_size)
+
+    size = (N * batch_size, N * batch_size)
+    # Return a coalesced sparse tensor for downstream operations
+    return torch.sparse_coo_tensor(expanded, expanded_values, size=size, device=device).coalesce()
+
+
 # %%
 class Simulator():
-    def __init__(self, size=256, wind_speed=0, wind_direction=[0,0], response_rate=0.1, response_start=20, base_spread_rate=0.3, n_components=None, decay_rate=1e-3):
+    def __init__(self, size=256, wind_speed=0, wind_direction=[0,0], response_rate=0.01, response_start=20, base_spread_rate=0.01, n_components=None, decay_rate=1e-3):
         self.size = size
         self.map = np.zeros((size, size))
         self.wind_speed = wind_speed
@@ -110,82 +191,26 @@ class Simulator():
         self.time += 1
 
     def simulate(self):
-        nodes = np.random.poisson(3)
+        nodes = max(np.random.poisson(3), 1)
 
         x_init, y_init = np.random.randint(0, self.size, size=2)
-        self.map[x_init, y_init] = np.random.poisson(3)
+        self.map[x_init, y_init] = max(min(np.random.poisson(3), 5), 1)
 
         for _ in range(nodes - 1):
             while True:
                 x, y = np.random.randint(-20, 21, size=2)
-                if x_init+x < self.size and y_init+y < self.size:
+                new_x, new_y = x_init + x, y_init + y
+
+                if 0 <= new_x < self.size and 0 <= new_y < self.size:
+                    if self.map[new_x, new_y] == 0:
+                        self.map[new_x, new_y] = min(np.random.poisson(3), 5)
                     break
-                
-            if self.map[x_init+x, y_init+y] == 0:
-                self.map[x_init+x, y_init+y] = np.random.poisson(3)
-                break
     
         while np.any(self.map > 0):
             self.step()
 
-# %%
-#simulator = Simulator(size=256, wind_speed=1.5, wind_direction=[1,2], response_rate=0.05, response_start=100, base_spread_rate=0.05)
-#simulator.simulate()
-
-# %%
-def make_heatmap_gif(simulator, filename="simulation.gif", cmap="plasma"):
-    '''
-    Create gif of simulation results.
-    '''
-    
-    times = sorted(simulator.maps.keys())
-    frames = [simulator.maps[t] for t in times]
-
-    fig, ax = plt.subplots()
-
-    # --- fire as background ---
-    vmin, vmax = np.min(frames), np.max(frames)
-    fire_img = ax.imshow(frames[0], cmap=cmap, vmin=vmin, vmax=vmax)
-
-    # --- terrain overlay ---
-    terrain_img = ax.imshow(simulator.terrain, cmap="Greens", alpha=0.2)  # low alpha on top
-
-    cbar = fig.colorbar(fire_img, ax=ax)
-    cbar.set_label("Fire Intensity", rotation=270, labelpad=15)
-
-    def update(frame):
-        fire_img.set_data(frame)    
-        return [fire_img, terrain_img]
-
-    ani = animation.FuncAnimation(
-        fig, update, frames=frames, interval=60, blit=True
-    )
-
-    ani.save(filename, writer="pillow")
-    plt.close(fig)
-
-# make_heatmap_gif(simulator, "fire.gif")
-
-# %%
-def adjacency_matrix(length, width):
-    '''
-    Sparse adjacency matrix generator for an n x n undirected graph, where each node is connected to its immediate neighbors and itself.
-    '''
-    N = length * width
-    adj = lil_matrix((N, N), dtype=np.float32)
-    directions = [(-1,0), (-1,1), (0,1), (1,1), (1,0), (1,-1), (0,-1), (-1,-1), (0,0)] # 8 sided
-    for i in range(N):
-        x, y = divmod(i, width)
-        for dx, dy in directions:
-            nx, ny = x+dx, y+dy
-            if 0 <= nx < length and 0 <= ny < width:
-                j = nx*width + ny
-                adj[i,j] = 1
-    return adj.tocoo()
-
-# %%
 class FireGraph(Dataset):
-    def __init__(self, length=256, width=256, path="simulation_data"):
+    def __init__(self, length=128, width=128, path="simulation_data"):
         self.path = path
         self.length = length
         self.width = width
@@ -237,63 +262,18 @@ class FireGraph(Dataset):
         '''
         Reads data on drive to be used in training.
         pct = percentage of data to be read from disk
-        This function is defensive: it handles files saved with 2D (single-timestep) or 3D (T, N, F) shapes.
-        Files with unexpected dimensions are skipped and reported.
         '''
         arrays = []
-        bad_files = []
         for file in os.listdir(self.save_dir):
-            if not file.endswith(".npy"):
-                continue
-            path = os.path.join(self.save_dir, file)
-            try:
-                arr = np.load(path, mmap_mode='r')
-            except Exception as e:
-                print(f"Warning: failed to load {path}: {e}")
-                bad_files.append((file, 'load_error', str(e)))
-                continue
-
-            if arr.ndim == 3:
-                T = arr.shape[0]
-            elif arr.ndim == 2:
-                # Likely a single-simulation with a single timestep saved as (N, F+1)
-                arr = arr[np.newaxis, ...]
-                T = 1
-                print(f"Info: treating 2D file as single-timestep simulation: {file}")
-            else:
-                print(f"Warning: skipping {file} with unexpected ndim={arr.ndim}")
-                bad_files.append((file, 'bad_ndim', arr.ndim))
-                continue
-
-            if T == 0:
-                print(f"Warning: skipping {file} with zero timesteps")
-                bad_files.append((file, 'zero_timesteps', None))
-                continue
-
-            try:
+            if file.endswith(".npy"):
+                arr = np.load(os.path.join(self.save_dir, file), mmap_mode='r')
                 n = arr.shape[0]
-                m = max(1, math.ceil(pct * n))
+                m = math.ceil(pct * n)
                 idx = np.random.choice(n, size=m, replace=False)
                 arrays.append(arr[idx])
-            except Exception as e:
-                print(f"Warning: error while sampling {file}: {e}")
-                bad_files.append((file, 'sample_error', str(e)))
-                continue
 
         if arrays:
-            try:
-                self.data = np.concatenate(arrays, axis=0)
-            except Exception as e:
-                print(f"Error concatenating arrays: {e}")
-                # fallback: try to stack as list of objects to preserve data for inspection
-                self.data = np.array(arrays, dtype=object)
-        else:
-            self.data = []
-
-        if bad_files:
-            print("generate_dataset finished with warnings. Problematic files:")
-            for fname, reason, info in bad_files:
-                print(f" - {fname}: {reason} {'' if info is None else info}")
+            self.data = np.concatenate(arrays, axis=0)
 
     def __len__(self):
         return len(self.data)
@@ -303,13 +283,12 @@ class FireGraph(Dataset):
         x = arr[:, :-1]       # (N, F)
         y = arr[:, -1]        # (N,)
         return torch.from_numpy(x).float(), torch.from_numpy(y).long()
+    
 
-
-# %%
 # referenced https://github.com/gordicaleksa/pytorch-GAT/blob/main/The%20Annotated%20GAT%20(Cora).ipynb for some of the code.
 
 class BelieverModel(nn.Module):
-    def __init__(self, nodes=256*256, input_features=7, num_layers=3, num_heads=3, num_features_per_head=4, num_output_classes=5, dropout=False):
+    def __init__(self, nodes=256*256, input_features=7, num_layers=3, num_heads=10, num_features_per_head=5, num_output_classes=6, dropout=False):
         super().__init__()
         self.leakyrelu = nn.LeakyReLU(0.2)
         self.relu = nn.ReLU()
@@ -399,9 +378,8 @@ class BelieverModel(nn.Module):
         logits = self.final_transformation(x)
         return logits
 
-# %%
 class DatasetGenerator():
-    def __init__(self, size=128, wind_speed=1.5, wind_direction=[1,2], response_rate=0.03, response_start=100, base_spread_rate=0.03, perturb=True):
+    def __init__(self, size=128, wind_speed=1.5, wind_direction=[1,2], response_rate=0.01, response_start=100, base_spread_rate=0.01, perturb=True):
         self.size = size
         self.wind_speed = wind_speed
         self.wind_direction = wind_direction
@@ -453,45 +431,21 @@ class DatasetGenerator():
                 
             self.dataset.save_data(np.array(simulation_data))
 
-
-# %%
-def block_diag_batch(adj, batch_size):
-    """
-    Build block-diagonal adjacency matrix for efficient processing of batches.
-    Accepts a sparse COO tensor (may be uncoalesced) and returns a block-diagonal
-    sparse COO tensor on the same device.
-    """
-    # ensure the sparse tensor is coalesced before accessing indices/values
-    adj = adj.coalesce()
-
-    N = adj.size(0)
-    indices = adj.indices()   # (2, E)
-    values = adj.values()     # (E,)
-
-    device = indices.device
-
-    offsets = torch.arange(batch_size, device=device) * N
-    offsets = offsets.view(1, -1, 1)  # (1, B, 1)
-
-    expanded = indices.unsqueeze(1).expand(-1, batch_size, -1)  # (2, B, E)
-    expanded = expanded + offsets  # broadcast add -> shifted indices per block
-    expanded = expanded.permute(1, 0, 2).reshape(2, -1)  # (2, B*E)
-
-    expanded_values = values.repeat(batch_size)
-
-    size = (N * batch_size, N * batch_size)
-    return torch.sparse_coo_tensor(expanded, expanded_values, size=size, device=device)
-
-
-# %%
 class Trainer():
-    def __init__(self, size=128, model_layers=10, lr=1e-4, num_output_classes=5, model_dir=None):
+    def __init__(self, size=128, model_layers=10, lr=1e-4, num_output_classes=6, model_dir=None, cnn=True):
         self.generator = DatasetGenerator(size=size)
 
-        self.model_dir = model_dir
-        self.model = BelieverModel(num_layers=model_layers, num_output_classes=num_output_classes, nodes=size**2)
+        if cnn:
+            self.model = BelieverCNN(size=size, num_output_classes=num_output_classes, encoder_layers=model_layers, hidden_channels=32)
+        else:
+            self.model = BelieverModel(num_layers=model_layers, num_output_classes=num_output_classes, nodes=size**2)
+        
         if model_dir:
             self.model.load_state_dict(torch.load(model_dir))
+            self.model_dir = model_dir
+        else:
+            self.model_dir = f"model/model{size}.pth"
+
 
         if torch.cuda.device_count() > 1:
             self.model = nn.DataParallel(self.model)
@@ -499,7 +453,7 @@ class Trainer():
 
 
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr, weight_decay=0.01)
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=0.95)
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1, gamma=0.9)
 
         self.loss_fn = nn.CrossEntropyLoss() # ordinal labels
 
@@ -519,7 +473,7 @@ class Trainer():
                 os.remove(os.path.join(dir, f))
 
     def train_without_replacement(self, device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-              num_sims=20, num_epochs=100):
+              num_sims=100, num_epochs=100):
         '''
         Generates new simulations for each epoch and clears old simulations to reduce overfitting risk.
         '''
@@ -530,7 +484,7 @@ class Trainer():
         for epoch in range(num_epochs):
             self.generate(num_sims=num_sims)
 
-            self.generator.dataset.generate_dataset(pct=1)
+            self.generator.dataset.generate_dataset()
             print(f"Generated the simulations for {epoch+1}/{num_epochs}.")
             train_loader = DataLoader(self.generator.dataset, batch_size=32, shuffle=True,
                                       num_workers=4, pin_memory=True, persistent_workers=True)
@@ -561,7 +515,7 @@ class Trainer():
 
                 total_loss += loss.item()
                 preds = logits.argmax(dim=-1)
-                total_correct += (preds == batch_y).sum().item()
+                total_correct += (preds == batch_y.reshape(-1)).sum().item()
                 total_nodes += batch_y.numel()
 
             avg_loss = total_loss / len(train_loader)
@@ -581,8 +535,6 @@ class Trainer():
 
         self.model.to(device)
         self.model.train()
-
-        print('Starting training.')
     
         for epoch in range(num_epochs):
             
@@ -618,7 +570,7 @@ class Trainer():
 
                 total_loss += loss.item()
                 preds = logits.argmax(dim=-1)
-                total_correct += (preds == batch_y).sum().item()
+                total_correct += (preds == batch_y.reshape(-1)).sum().item()
                 total_nodes += batch_y.numel()
 
             avg_loss = total_loss / len(train_loader)
@@ -725,61 +677,157 @@ class Trainer():
 
             return fire_imgs + terrain_imgs
 
-        ani = animation.FuncAnimation(fig, update, frames=max_frame, interval=200, blit=False)
+        ani = animation.FuncAnimation(fig, update, frames=max_frame, interval=60, blit=False)
         ani.save(filename, writer="pillow")
         plt.close(fig)
 
     def save_model(self):
         torch.save(self.model.state_dict(), self.model_dir)
 
+# %%
+class BelieverCNN(nn.Module):
+    def __init__(self, size=128, input_channels=7, num_output_classes=6, encoder_layers=5, hidden_channels=32):
+        super().__init__()
+        self.size = size
+        self.input_channels = input_channels
+        self.num_output_classes = num_output_classes
+        
+        # input: (B, 7, H, W)
+        encoders = []
+        for _ in range(encoder_layers):
+            encoders.extend([
+                nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding='same'),
+                nn.BatchNorm2d(hidden_channels),
+                nn.ReLU(inplace=True)
+            ])
+            input_channels = hidden_channels
+
+
+        self.encoder = nn.Sequential(*encoders)
+
+        self.decoder = nn.Sequential(
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding='same'),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(hidden_channels, num_output_classes, kernel_size=1)
+        )
+
+    def forward(self, x, adj):
+        """
+        x: (B*N, F) where N = size^2
+        Returns: (B*N, num_output_classes)
+        """
+        B = x.shape[0] // (self.size ** 2)
+        F = self.input_channels
+        H = W = self.size
+
+        # reshape to (B, F, H, W)
+        x = x.view(B, H, W, F).permute(0, 3, 1, 2)  # (B, F, H, W)
+        x = self.encoder(x)
+        x = self.decoder(x)  # (B, num_output_classes, H, W)
+
+        # flatten back to (B*N, num_output_classes)
+        x = x.permute(0, 2, 3, 1).reshape(B * H * W, self.num_output_classes)
+        return x
 
 # %%
-model_dir = "model/model.pth"
-trainer = Trainer(model_dir = model_dir)
+def _worker_simulate_and_save(worker_idx, size, base_kwargs, save_dir):
+    np.random.seed(int(time.time()) ^ (os.getpid() << 16) ^ worker_idx)  # reseed
+    sim = Simulator(size=size,
+                    wind_speed=base_kwargs.get('wind_speed', 1.5),
+                    wind_direction=base_kwargs.get('wind_direction', [1,2]),
+                    response_rate=base_kwargs.get('response_rate', 0.03),
+                    response_start=base_kwargs.get('response_start', 100),
+                    base_spread_rate=base_kwargs.get('base_spread_rate', 0.03),
+                    n_components=base_kwargs.get('n_components', None),
+                    decay_rate=base_kwargs.get('decay_rate', 1e-3))
+    sim.simulate()
+
+    dataset = FireGraph(length=size, width=size)
+    simulation_data = []
+    past_info = np.zeros((size, size, 2), dtype=np.float32)
+    for t in sorted(sim.maps.keys()):
+        if 0.5 > np.random.rand():
+            coords = np.random.randint(0, size, 2)
+            if t > 0:
+                prev_map = sim.maps[t-1]
+                y_min, y_max = max(0, coords[0]-5), min(size, coords[0]+6)
+                x_min, x_max = max(0, coords[1]-5), min(size, coords[1]+6)
+                past_info[y_min:y_max, x_min:x_max, 0] = prev_map[y_min:y_max, x_min:x_max]
+                past_info[y_min:y_max, x_min:x_max, 1] = 0
+            past_info[:, :, 1] += 1
+
+        dp = dataset.generate_data(topology=sim.terrain,
+                                   past_info=past_info,
+                                   wind_direction=np.array(sim.wind_direction),
+                                   wind_speed=sim.wind_speed,
+                                   time=t,
+                                   label=sim.maps[t])
+        simulation_data.append(dp)
+
+    out = np.array(simulation_data)
+
+    # unique filename: timestamp + pid + worker idx
+    fname_base = f"{int(time.time()):d}_{os.getpid()}_{worker_idx}"
+    p = os.path.join(save_dir, fname_base + '.npy')
+    np.save(p, out)
+    return p
 
 # %%
-#trainer.clear_data()
+# Parallel simulation generator using ProcessPoolExecutor
+
+def generate_parallel(num_sims=100, size=128, base_kwargs=None):
+    if base_kwargs is None:
+        base_kwargs = {}
+    save_dir = os.path.join('simulation_data', f"{size}x{size}")
+    os.makedirs(save_dir, exist_ok=True)
+  
+    available_cpus = multiprocessing.cpu_count()
+    max_workers = max(1, available_cpus - 1)
+
+    futures = []
+    created = []
+    with ProcessPoolExecutor(max_workers=max_workers) as exe:
+        for i in range(num_sims):
+            futures.append(exe.submit(_worker_simulate_and_save, i, size, base_kwargs, save_dir))
+        for fut in as_completed(futures):
+            try:
+                path = fut.result()
+                created.append(path)
+            except Exception as e:
+                print('Worker failed:', e)
+
+    print(f'Finished. Created {len(created)} files in {save_dir}')
+    return created
 
 # %%
-#for i in range(10):
-#    trainer.generate(num_sims=100)
+import shutil
+
+def run_overfit_with_replacement(size=64, num_sims=32, num_epochs=10, lr=1e-3, device=torch.device('cpu')):
+
+    trainer = Trainer(size=size, model_layers=32, lr=lr, num_output_classes=6, model_dir=None)
+    save_dir = trainer.generator.dataset.save_dir
+
+    if os.path.isdir(save_dir):
+        print('Removing existing save_dir to ensure clean dataset:', save_dir)
+        shutil.rmtree(save_dir)
+
+    # Ensure save_dir exists again so Trainer.generate can write files
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f'Starting Trainer.train_with_replacement for {num_epochs} epoch(s) on device={device}')
+    trainer.train_without_replacement(device=device, num_epochs=num_epochs, num_sims=num_sims)
+
+    return trainer
+
+#trainer = run_overfit_with_replacement(size=64, num_sims=64, num_epochs=10, device=torch.device('cpu'))
+#trainer.generate_comparison_gif(new_sim=True)
 
 # %%
-trainer.train_without_replacement()
-
-# %%
+#model_dir = "model/model128.pth"
+trainer = Trainer(size=128, model_layers=32, lr=1e-3, num_output_classes=6, model_dir=None)
+trainer.train_without_replacement(device=torch.device('cpu'), num_sims=64, num_epochs=20)
 trainer.generate_comparison_gif(new_sim=True)
-
-# %%
-# Delete .npy files whose arrays have ndim == 1 (problematic files)
-import os, numpy as np
-
-dataset_dir = trainer.generator.dataset.save_dir if 'trainer' in globals() else os.path.join('simulation_data', f"{128}x{128}")
-
-to_delete = []
-for f in os.listdir(dataset_dir):
-    if not f.endswith('.npy'):
-        continue
-    p = os.path.join(dataset_dir, f)
-    try:
-        arr = np.load(p, mmap_mode='r')
-    except Exception as e:
-        print(f"Could not load {f}: {e}; skipping")
-        continue
-    if getattr(arr, 'ndim', None) == 1:
-        to_delete.append(p)
-
-print(f"Found {len(to_delete)} files to delete:")
-for p in to_delete:
-    print(' -', p)
-
-for p in to_delete:
-    try:
-        os.remove(p)
-    except Exception as e:
-        print(f"Failed to delete {p}: {e}")
-
-print('Deletion complete.')
-
 
 
